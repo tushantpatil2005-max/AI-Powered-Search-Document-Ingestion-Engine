@@ -1,79 +1,537 @@
 """
-AI-Powered Search & Document Ingestion Engine
-Tech Stack: FastAPI, Sentence-Transformers, Qdrant Vector DB, PyMuPDF, Pandas
+Document Ingestion & Search Engine
+==================================
+Ingests PDF, CSV and XLSX files, splits them into chunks, embeds each chunk with a sentence-embedding
+model, and stores the vectors in Qdrant. Search embeds the query and returns the closest chunks, with
+optional metadata filters (file type, source file, category).
+
+Stack: FastAPI, sentence-transformers, Qdrant, PyMuPDF, pandas (XLSX), openpyxl.
+
+Install:   pip install fastapi "uvicorn[standard]" python-multipart sentence-transformers \\
+                       "qdrant-client>=1.10" pymupdf pandas openpyxl
+Run:       uvicorn main:app            (or: python main.py)
+Test:      pip install httpx && python -m unittest test_main -v
+
+Configuration (environment variables)
+  QDRANT_URL                    Qdrant server URL. Unset: an in-memory store (data is lost on restart).
+  QDRANT_API_KEY                Qdrant API key, if the server requires one.
+  COLLECTION_NAME               default "enterprise_documents"
+  EMBEDDING_MODEL               default "all-MiniLM-L6-v2"
+  API_KEY                       If set, /ingest, /search and /documents require the X-API-Key header.
+  MAX_UPLOAD_MB                 default 50
+  MAX_CHUNKS_PER_DOCUMENT       default 50000
+  CHUNK_WORDS / CHUNK_OVERLAP   default 160 / 30 (see the note on model input length below)
+  EMBED_BATCH_SIZE              default 64
+  LOG_LEVEL                     default INFO
+
+Endpoints
+  POST   /ingest      multipart: file (pdf, csv, xlsx), optional custom_category
+  POST   /search      JSON: query, limit, doc_type, source, category, score_threshold
+  DELETE /documents   query: source=<filename>
+  GET    /health
+
+Notes
+  * all-MiniLM-L6-v2 reads at most 256 word pieces per input and silently ignores the rest, so chunks
+    must be short. The 160-word default fits; the engine warns at startup if the setting is too large.
+  * Re-uploading a file with the same name replaces its earlier version; re-uploading identical content
+    is a no-op. Point ids are deterministic, so retries cannot create duplicates.
+  * Legacy .xls files are not supported (convert to .xlsx).
 """
+from __future__ import annotations
 
+import csv
+import hashlib
+import hmac
 import io
+import logging
 import os
+import re
+import threading
 import uuid
-from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Protocol, Sequence
 
-import fitz  # PyMuPDF
-import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
-from pydantic import BaseModel, Field
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from sentence_transformers import SentenceTransformer
+from fastapi import (APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response,
+                     UploadFile, status)
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 
-# ==========================================
-# Configuration & Global State
-# ==========================================
-COLLECTION_NAME = "enterprise_documents"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-VECTOR_DIMENSION = 384
-QDRANT_HOST = os.getenv("QDRANT_HOST", ":memory:")  # Defaults to in-memory for testing
-
-client: Optional[QdrantClient] = None
-model: Optional[SentenceTransformer] = None
+logger = logging.getLogger("document_search")
 
 
-# ==========================================
-# Application Lifespan (Startup/Shutdown)
-# ==========================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global client, model
-    # Initialize Embedding Model
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    
-    # Initialize Qdrant Client
-    client = QdrantClient(location=QDRANT_HOST)
-    
-    # Ensure Collection Exists
-    collections = client.get_collections().collections
-    exists = any(c.name == COLLECTION_NAME for c in collections)
-    if not exists:
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(
-                size=VECTOR_DIMENSION, 
-                distance=models.Distance.COSINE
-            ),
+# ============================================================================
+# Settings
+# ============================================================================
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+
+
+@dataclass(frozen=True)
+class Settings:
+    collection_name: str = "enterprise_documents"
+    embedding_model: str = "all-MiniLM-L6-v2"
+    qdrant_url: Optional[str] = None
+    qdrant_api_key: Optional[str] = None
+    api_key: Optional[str] = None
+    max_upload_bytes: int = 50 * 1024 * 1024
+    max_chunks_per_document: int = 50_000
+    chunk_words: int = 160
+    chunk_overlap: int = 30
+    embed_batch_size: int = 64
+    log_level: str = "INFO"
+
+    def __post_init__(self) -> None:
+        if self.max_upload_bytes <= 0 or self.max_chunks_per_document <= 0 or self.embed_batch_size <= 0:
+            raise ValueError("Upload, chunk-count and batch limits must be positive")
+        if self.chunk_words <= 0 or not 0 <= self.chunk_overlap < self.chunk_words:
+            raise ValueError("CHUNK_WORDS must be positive and CHUNK_OVERLAP must be in [0, CHUNK_WORDS)")
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        return cls(
+            collection_name=os.getenv("COLLECTION_NAME", cls.collection_name),
+            embedding_model=os.getenv("EMBEDDING_MODEL", cls.embedding_model),
+            qdrant_url=os.getenv("QDRANT_URL") or None,
+            qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
+            api_key=os.getenv("API_KEY") or None,
+            max_upload_bytes=_env_int("MAX_UPLOAD_MB", 50) * 1024 * 1024,
+            max_chunks_per_document=_env_int("MAX_CHUNKS_PER_DOCUMENT", cls.max_chunks_per_document),
+            chunk_words=_env_int("CHUNK_WORDS", cls.chunk_words),
+            chunk_overlap=_env_int("CHUNK_OVERLAP", cls.chunk_overlap),
+            embed_batch_size=_env_int("EMBED_BATCH_SIZE", cls.embed_batch_size),
+            log_level=os.getenv("LOG_LEVEL", cls.log_level).upper(),
         )
-    yield
-    # Cleanup on shutdown
-    if client:
-        client.close()
 
 
-app = FastAPI(
-    title="AI Document Ingestion & Search Engine",
-    description="Scalable pipeline for ingesting PDF, CSV, XLSX and hybrid semantic search via Qdrant.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+# ============================================================================
+# Errors and data types
+# ============================================================================
+
+class IngestError(Exception):
+    """Raised for problems with an uploaded file. The message is safe to show to the client."""
+    status_code = 400
 
 
-# ==========================================
-# Schemas
-# ==========================================
+class UnsupportedFileType(IngestError):
+    status_code = 415
+
+
+class UnreadableDocument(IngestError):
+    status_code = 422
+
+
+class EmptyDocument(IngestError):
+    status_code = 422
+
+
+class DocumentTooLarge(IngestError):
+    status_code = 413
+
+
+@dataclass(frozen=True)
+class Chunk:
+    text: str
+    metadata: Dict[str, Any] = field(default_factory=dict)      # e.g. {"page": 3} or {"sheet": "Q1", "row": 7}
+
+
+@dataclass(frozen=True)
+class PointRecord:
+    id: str
+    vector: List[float]
+    payload: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Hit:
+    id: str
+    score: float
+    payload: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    source: str
+    document_id: str
+    chunks: int
+    status: str          # "indexed" or "unchanged"
+
+
+# ============================================================================
+# Text utilities
+# ============================================================================
+
+def chunk_words(text: str, size: int, overlap: int) -> List[str]:
+    """Split text into windows of `size` words that overlap by `overlap` words.
+    The last window ends exactly at the end of the text (no redundant tail chunk)."""
+    if size <= 0 or not 0 <= overlap < size:
+        raise ValueError("size must be positive and overlap must be in [0, size)")
+    words = text.split()
+    if not words:
+        return []
+    step, chunks, start = size - overlap, [], 0
+    while True:
+        chunks.append(" ".join(words[start:start + size]))
+        if start + size >= len(words):
+            return chunks
+        start += step
+
+
+def sanitize_filename(name: Optional[str]) -> str:
+    """Keep only the base name; drop directories and control characters."""
+    base = Path((name or "").replace("\\", "/")).name
+    base = re.sub(r"[\x00-\x1f\x7f]", "", base).strip()
+    return base[:255] or "unknown"
+
+
+def file_extension(filename: str) -> str:
+    return Path(filename).suffix.lower().lstrip(".")
+
+
+def matches_signature(ext: str, data: bytes) -> bool:
+    """Cheap content check so a renamed file is rejected early. CSV has no signature."""
+    if ext == "pdf":
+        return b"%PDF-" in data[:1024]
+    if ext == "xlsx":
+        return data.startswith(b"PK\x03\x04")
+    return True
+
+
+def read_limited(read: Callable[[int], bytes], limit: int, block: int = 1 << 20) -> bytes:
+    """Read a stream fully, refusing to buffer more than `limit` bytes."""
+    buf = bytearray()
+    while True:
+        part = read(block)
+        if not part:
+            return bytes(buf)
+        buf += part
+        if len(buf) > limit:
+            raise DocumentTooLarge(f"The file exceeds the {limit // (1024 * 1024)} MB upload limit")
+
+
+def _row_text(pairs: Iterable[tuple]) -> str:
+    return ", ".join(f"{key}: {value}" for key, value in pairs)
+
+
+def _row_chunks(text: str, metadata: Dict[str, Any], settings: Settings) -> Iterator[Chunk]:
+    for piece in chunk_words(text, settings.chunk_words, settings.chunk_overlap):
+        yield Chunk(piece, dict(metadata))
+
+
+# ============================================================================
+# Extractors: bytes -> chunks
+# ============================================================================
+
+def extract_pdf(data: bytes, settings: Settings) -> Iterator[Chunk]:
+    import fitz  # PyMuPDF
+
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        if doc.needs_pass:
+            raise UnreadableDocument("The PDF is password-protected")
+        for number, page in enumerate(doc, start=1):
+            for piece in chunk_words(page.get_text(), settings.chunk_words, settings.chunk_overlap):
+                yield Chunk(piece, {"page": number})
+
+
+def _decode_text(data: bytes) -> str:
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")        # never fails; covers most spreadsheet exports
+
+
+def detect_delimiter(text: str) -> str:
+    """Pick the most frequent of , ; tab | in the first non-empty line (the header). Defaults to a comma."""
+    first = next((line for line in text.splitlines() if line.strip()), "")
+    best = max(",;\t|", key=lambda d: first.count(d))
+    return best if first.count(best) else ","
+
+
+def extract_csv(data: bytes, settings: Settings) -> Iterator[Chunk]:
+    """One chunk per row ("column: value, ..."). Values are kept exactly as written."""
+    text = _decode_text(data)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=detect_delimiter(text))
+    header = next(reader, None)
+    if not header:
+        return
+    names = [h.strip() or f"column_{i + 1}" for i, h in enumerate(header)]
+    for number, row in enumerate(reader, start=1):
+        pairs = [(names[i] if i < len(names) else f"column_{i + 1}", v.strip())
+                 for i, v in enumerate(row) if v.strip()]
+        if pairs:
+            yield from _row_chunks(_row_text(pairs), {"row": number}, settings)
+
+
+def extract_xlsx(data: bytes, settings: Settings) -> Iterator[Chunk]:
+    """One chunk per row, across all sheets. Cells are read as text."""
+    import pandas as pd
+
+    book = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
+    for sheet in book.sheet_names:
+        frame = pd.read_excel(book, sheet_name=sheet, dtype=str).fillna("")
+        columns = [str(c) for c in frame.columns]
+        for index, values in enumerate(frame.itertuples(index=False, name=None)):
+            pairs = [(columns[i], str(v).strip()) for i, v in enumerate(values) if str(v).strip()]
+            if pairs:
+                text = f"[Sheet: {sheet}] " + _row_text(pairs)
+                yield from _row_chunks(text, {"sheet": sheet, "row": index + 2}, settings)   # row 1 is the header
+
+
+EXTRACTORS: Dict[str, Callable[[bytes, Settings], Iterator[Chunk]]] = {
+    "pdf": extract_pdf, "csv": extract_csv, "xlsx": extract_xlsx,
+}
+
+
+def safe_chunks(extractor: Callable[[bytes, Settings], Iterator[Chunk]], data: bytes,
+                settings: Settings) -> Iterator[Chunk]:
+    """Run an extractor, turning parser failures into a client error instead of a 500.
+    Missing optional libraries (ImportError) are deployment problems and still propagate."""
+    try:
+        yield from extractor(data, settings)
+    except (IngestError, ImportError):
+        raise
+    except Exception as exc:
+        logger.warning("Could not parse document (%s)", type(exc).__name__)
+        raise UnreadableDocument("The file could not be read; it may be corrupt") from exc
+
+
+# ============================================================================
+# Embedding model and vector-store adapters
+# ============================================================================
+
+class Embedder(Protocol):
+    name: str
+    dimension: int
+    max_tokens: int
+
+    def encode(self, texts: Sequence[str]) -> List[List[float]]: ...
+
+
+class VectorStore(Protocol):
+    def ensure_collection(self, dimension: int) -> None: ...
+    def upsert(self, points: Sequence[PointRecord]) -> None: ...
+    def search(self, vector: Sequence[float], limit: int, filters: Dict[str, str],
+               score_threshold: Optional[float]) -> List[Hit]: ...
+    def count_document(self, source: str, document_id: str) -> int: ...
+    def delete_stale(self, source: str, keep_document_id: str) -> None: ...
+    def delete_document(self, source: str, document_id: str) -> None: ...
+    def delete_source(self, source: str) -> int: ...
+    def ping(self) -> None: ...
+    def close(self) -> None: ...
+
+
+class SentenceTransformerEmbedder:
+    def __init__(self, model_name: str, batch_size: int = 64) -> None:
+        from sentence_transformers import SentenceTransformer
+
+        self._model = SentenceTransformer(model_name)
+        self.name = model_name
+        self.dimension = int(self._model.get_sentence_embedding_dimension())
+        self.max_tokens = int(self._model.max_seq_length)
+        self._batch_size = batch_size
+        self._lock = threading.Lock()          # one inference at a time; avoids CPU oversubscription
+
+    def encode(self, texts: Sequence[str]) -> List[List[float]]:
+        with self._lock:
+            vectors = self._model.encode(list(texts), batch_size=self._batch_size,
+                                         normalize_embeddings=True, show_progress_bar=False)
+        return vectors.tolist()
+
+
+class QdrantStore:
+    """Qdrant adapter. Requires qdrant-client >= 1.10 (uses query_points)."""
+    INDEXED_FIELDS = ("source", "doc_type", "category", "document_id")
+
+    def __init__(self, settings: Settings) -> None:
+        from qdrant_client import QdrantClient
+
+        self._collection = settings.collection_name
+        if settings.qdrant_url:
+            self._client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+        else:
+            logger.warning("QDRANT_URL is not set: using an in-memory store; data is lost on restart")
+            self._client = QdrantClient(location=":memory:")
+
+    @staticmethod
+    def _filter(must: Dict[str, str], must_not: Optional[Dict[str, str]] = None):
+        from qdrant_client.http import models
+
+        def conditions(items: Dict[str, str]):
+            return [models.FieldCondition(key=k, match=models.MatchValue(value=v)) for k, v in items.items()]
+        return models.Filter(must=conditions(must) or None, must_not=conditions(must_not or {}) or None)
+
+    def ensure_collection(self, dimension: int) -> None:
+        from qdrant_client.http import models
+
+        if self._client.collection_exists(self._collection):
+            vectors = self._client.get_collection(self._collection).config.params.vectors
+            size = getattr(vectors, "size", None)
+            if size is not None and size != dimension:
+                raise RuntimeError(f"Collection '{self._collection}' has vector size {size} but the model produces "
+                                   f"{dimension}. Use a new COLLECTION_NAME or re-index.")
+        else:
+            self._client.create_collection(
+                collection_name=self._collection,
+                vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE))
+        for name in self.INDEXED_FIELDS:        # makes filtered search fast on a server
+            try:
+                self._client.create_payload_index(self._collection, field_name=name,
+                                                  field_schema=models.PayloadSchemaType.KEYWORD)
+            except Exception:
+                logger.warning("Could not create payload index on %s", name, exc_info=True)
+
+    def upsert(self, points: Sequence[PointRecord]) -> None:
+        from qdrant_client.http import models
+
+        self._client.upsert(
+            collection_name=self._collection, wait=True,
+            points=[models.PointStruct(id=p.id, vector=p.vector, payload=p.payload) for p in points])
+
+    def search(self, vector, limit, filters, score_threshold) -> List[Hit]:
+        response = self._client.query_points(
+            collection_name=self._collection, query=list(vector), limit=limit, with_payload=True,
+            query_filter=self._filter(filters) if filters else None, score_threshold=score_threshold)
+        return [Hit(str(p.id), float(p.score), dict(p.payload or {})) for p in response.points]
+
+    def count_document(self, source: str, document_id: str) -> int:
+        flt = self._filter({"source": source, "document_id": document_id})
+        return int(self._client.count(self._collection, count_filter=flt, exact=True).count)
+
+    def _delete(self, flt) -> None:
+        from qdrant_client.http import models
+
+        self._client.delete(self._collection, points_selector=models.FilterSelector(filter=flt), wait=True)
+
+    def delete_stale(self, source: str, keep_document_id: str) -> None:
+        self._delete(self._filter({"source": source}, {"document_id": keep_document_id}))
+
+    def delete_document(self, source: str, document_id: str) -> None:
+        self._delete(self._filter({"source": source, "document_id": document_id}))
+
+    def delete_source(self, source: str) -> int:
+        flt = self._filter({"source": source})
+        count = int(self._client.count(self._collection, count_filter=flt, exact=True).count)
+        if count:
+            self._delete(flt)
+        return count
+
+    def ping(self) -> None:
+        self._client.get_collections()
+
+    def close(self) -> None:
+        self._client.close()
+
+
+# ============================================================================
+# Services
+# ============================================================================
+
+class IngestionService:
+    """parse -> chunk -> embed (in batches) -> upsert. Safe to retry."""
+
+    def __init__(self, embedder: Embedder, store: VectorStore, settings: Settings) -> None:
+        self.embedder, self.store, self.settings = embedder, store, settings
+
+    def ingest(self, filename: Optional[str], data: bytes, category: Optional[str] = None) -> IngestResult:
+        source = sanitize_filename(filename)
+        ext = file_extension(source)
+        extractor = EXTRACTORS.get(ext)
+        if extractor is None:
+            raise UnsupportedFileType(f"Unsupported file type '.{ext}'. Supported: {', '.join(EXTRACTORS)}")
+        if not data:
+            raise EmptyDocument("The file is empty")
+        if not matches_signature(ext, data):
+            raise UnreadableDocument(f"The content is not a valid .{ext} document")
+
+        document_id = hashlib.sha256(data).hexdigest()
+        existing = self.store.count_document(source, document_id)
+        if existing:
+            return IngestResult(source, document_id, existing, "unchanged")
+
+        category = (category or "").strip()[:100] or "general"
+        total, batch = 0, []
+        try:
+            for index, chunk in enumerate(safe_chunks(extractor, data, self.settings)):
+                if index >= self.settings.max_chunks_per_document:
+                    raise DocumentTooLarge(
+                        f"The document produces more than {self.settings.max_chunks_per_document} chunks")
+                batch.append((index, chunk))
+                if len(batch) >= self.settings.embed_batch_size:
+                    total += self._flush(batch, source, ext, document_id, category)
+                    batch = []
+            if batch:
+                total += self._flush(batch, source, ext, document_id, category)
+            if total == 0:
+                raise EmptyDocument("The document contains no extractable text")
+            self.store.delete_stale(source, document_id)       # drop chunks of the previous version
+        except Exception:
+            self._cleanup(source, document_id)
+            raise
+        logger.info("Indexed %s: %d chunks (document %s)", source, total, document_id[:12])
+        return IngestResult(source, document_id, total, "indexed")
+
+    def _flush(self, batch, source: str, ext: str, document_id: str, category: str) -> int:
+        vectors = self.embedder.encode([chunk.text for _, chunk in batch])
+        if len(vectors) != len(batch):
+            raise RuntimeError("Embedder returned a different number of vectors than inputs")
+        points = []
+        for (index, chunk), vector in zip(batch, vectors):
+            payload = {**chunk.metadata, "source": source, "doc_type": ext, "document_id": document_id,
+                       "chunk_index": index, "text": chunk.text, "category": category}
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}\x00{document_id}\x00{index}"))
+            points.append(PointRecord(point_id, vector, payload))
+        self.store.upsert(points)
+        return len(points)
+
+    def _cleanup(self, source: str, document_id: str) -> None:
+        try:
+            self.store.delete_document(source, document_id)    # remove any partial upload
+        except Exception:
+            logger.warning("Cleanup after a failed ingest also failed", exc_info=True)
+
+
+class SearchService:
+    def __init__(self, embedder: Embedder, store: VectorStore) -> None:
+        self.embedder, self.store = embedder, store
+
+    def search(self, query: str, limit: int, doc_type: Optional[str] = None, source: Optional[str] = None,
+               category: Optional[str] = None, score_threshold: Optional[float] = None) -> List[Hit]:
+        vector = self.embedder.encode([query])[0]
+        filters = {k: v for k, v in (("doc_type", (doc_type or "").lower().lstrip(".")),
+                                     ("source", source), ("category", category)) if v}
+        return self.store.search(vector, limit, filters, score_threshold)
+
+    def delete_source(self, source: str) -> int:
+        return self.store.delete_source(sanitize_filename(source))
+
+
+# ============================================================================
+# API schemas
+# ============================================================================
+
 class SearchRequest(BaseModel):
-    query: str = Field(..., description="Natural language search query")
+    query: str = Field(..., min_length=1, max_length=2000, description="Natural-language search query")
     limit: int = Field(5, ge=1, le=50, description="Number of results to return")
-    doc_type: Optional[str] = Field(None, description="Metadata filter by file extension (e.g., 'pdf', 'csv')")
-    source: Optional[str] = Field(None, description="Metadata filter by original filename")
+    doc_type: Optional[str] = Field(None, max_length=10, description="Filter by file type, e.g. 'pdf' or 'csv'")
+    source: Optional[str] = Field(None, max_length=255, description="Filter by original filename")
+    category: Optional[str] = Field(None, max_length=100, description="Filter by category")
+    score_threshold: Optional[float] = Field(None, ge=-1.0, le=1.0, description="Minimum similarity score")
+
+    @field_validator("query")
+    @classmethod
+    def query_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("query must not be blank")
+        return value
 
 
 class SearchHit(BaseModel):
@@ -91,185 +549,123 @@ class SearchResponse(BaseModel):
 
 class IngestResponse(BaseModel):
     filename: str
+    document_id: str
     chunks_indexed: int
     status: str
 
 
-# ==========================================
-# Ingestion & Parsing Helpers
-# ==========================================
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-    """Splits raw text into sliding window chunks."""
-    words = text.split()
-    if not words:
-        return []
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i : i + chunk_size])
-        chunks.append(chunk)
-    return chunks
+class DeleteResponse(BaseModel):
+    source: str
+    deleted_chunks: int
 
 
-def parse_pdf(file_bytes: bytes) -> str:
-    """Extracts text from PDF documents using PyMuPDF."""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text_content = []
-    for page in doc:
-        text_content.append(page.get_text())
-    return "\n".join(text_content)
+# ============================================================================
+# HTTP layer
+# ============================================================================
+
+router = APIRouter()
 
 
-def parse_csv(file_bytes: bytes) -> List[str]:
-    """Converts CSV rows into semantic key-value strings."""
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    return [
-        ", ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
-        for _, row in df.iterrows()
-    ]
+def require_api_key(request: Request, x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> None:
+    expected = request.app.state.settings.api_key
+    if expected and not (x_api_key and hmac.compare_digest(x_api_key.encode(), expected.encode())):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def parse_xlsx(file_bytes: bytes) -> List[str]:
-    """Converts Excel rows across all sheets into semantic text rows."""
-    excel_file = pd.ExcelFile(io.BytesIO(file_bytes))
-    chunks = []
-    for sheet_name in excel_file.sheet_names:
-        df = pd.read_excel(excel_file, sheet_name=sheet_name)
-        sheet_chunks = [
-            f"[Sheet: {sheet_name}] " + ", ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
-            for _, row in df.iterrows()
-        ]
-        chunks.extend(sheet_chunks)
-    return chunks
+@router.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(require_api_key)], tags=["ingestion"])
+def ingest_document(request: Request, response: Response, file: UploadFile = File(...),
+                    custom_category: Optional[str] = Form(None)):
+    """Ingest a PDF, CSV or XLSX file. Returns 201 when indexed, 200 when identical content was already indexed.
+    Runs in the thread pool (plain `def`) because parsing and embedding are CPU-bound."""
+    data = read_limited(file.file.read, request.app.state.settings.max_upload_bytes)
+    result = request.app.state.ingestion.ingest(file.filename, data, custom_category)
+    if result.status == "unchanged":
+        response.status_code = status.HTTP_200_OK
+    return IngestResponse(filename=result.source, document_id=result.document_id,
+                          chunks_indexed=result.chunks, status=result.status)
 
 
-# ==========================================
-# Endpoints
-# ==========================================
-@app.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
-async def ingest_document(
-    file: UploadFile = File(...),
-    custom_category: Optional[str] = Form(None)
-):
-    """
-    ETL endpoint: Ingests unstructured files (PDF, CSV, XLSX), generates embeddings,
-    and indexes them into Qdrant.
-    """
-    filename = file.filename or "unknown"
-    ext = filename.split(".")[-1].lower()
-    content = await file.read()
-    
-    # 1. Parse & Chunk Content
-    if ext == "pdf":
-        raw_text = parse_pdf(content)
-        chunks = chunk_text(raw_text)
-    elif ext == "csv":
-        chunks = parse_csv(content)
-    elif ext in ["xlsx", "xls"]:
-        chunks = parse_xlsx(content)
-    else:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported file format: .{ext}. Supported formats: PDF, CSV, XLSX."
-        )
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="Document contains no extractable text.")
-
-    # 2. Generate Semantic Embeddings (Batched)
-    embeddings = model.encode(chunks, batch_size=64, show_progress_bar=False).tolist()
-
-    # 3. Construct Qdrant Points with Rich Metadata
-    points = []
-    for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
-        point_id = str(uuid.uuid4())
-        payload = {
-            "source": filename,
-            "doc_type": ext,
-            "chunk_index": i,
-            "text": chunk,
-            "category": custom_category or "general"
-        }
-        points.append(
-            models.PointStruct(
-                id=point_id,
-                vector=vector,
-                payload=payload
-            )
-        )
-
-    # 4. Upload to Vector Store
-    client.upsert(
-        collection_name=COLLECTION_NAME,
-        points=points,
-        wait=True
-    )
-
-    return IngestResponse(
-        filename=filename,
-        chunks_indexed=len(points),
-        status="Indexed successfully"
-    )
+@router.post("/search", response_model=SearchResponse, dependencies=[Depends(require_api_key)], tags=["search"])
+def search_documents(payload: SearchRequest, request: Request):
+    """Semantic search over indexed chunks, with optional metadata filters."""
+    hits = request.app.state.search.search(payload.query, payload.limit, payload.doc_type, payload.source,
+                                           payload.category, payload.score_threshold)
+    results = [SearchHit(id=h.id, score=h.score, text=h.payload.get("text", ""),
+                         metadata={k: v for k, v in h.payload.items() if k != "text"}) for h in hits]
+    return SearchResponse(query=payload.query, total_results=len(results), results=results)
 
 
-@app.post("/search", response_model=SearchResponse)
-async def search_documents(request: SearchRequest):
-    """
-    Hybrid search endpoint: Performs vector similarity search with metadata filtering.
-    """
-    # 1. Generate Query Embedding
-    query_vector = model.encode(request.query).tolist()
-
-    # 2. Build Metadata Filter Conditions
-    filter_conditions = []
-    if request.doc_type:
-        filter_conditions.append(
-            models.FieldCondition(
-                key="doc_type",
-                match=models.MatchValue(value=request.doc_type.lower())
-            )
-        )
-    if request.source:
-        filter_conditions.append(
-            models.FieldCondition(
-                key="source",
-                match=models.MatchValue(value=request.source)
-            )
-        )
-
-    query_filter = models.Filter(must=filter_conditions) if filter_conditions else None
-
-    # 3. Search Qdrant
-    hits = client.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
-        query_filter=query_filter,
-        limit=request.limit
-    )
-
-    # 4. Format Output
-    results = [
-        SearchHit(
-            id=str(hit.id),
-            score=hit.score,
-            text=hit.payload.get("text", ""),
-            metadata={k: v for k, v in hit.payload.items() if k != "text"}
-        )
-        for hit in hits
-    ]
-
-    return SearchResponse(
-        query=request.query,
-        total_results=len(results),
-        results=results
-    )
+@router.delete("/documents", response_model=DeleteResponse, dependencies=[Depends(require_api_key)],
+               tags=["ingestion"])
+def delete_document(request: Request, source: str = Query(..., min_length=1, max_length=255)):
+    """Remove every chunk of one source file."""
+    deleted = request.app.state.search.delete_source(source)
+    return DeleteResponse(source=source, deleted_chunks=deleted)
 
 
-@app.get("/health")
-def health_check():
-    """Health check for container orchestrators."""
-    return {"status": "healthy", "vector_db": "connected", "model": EMBEDDING_MODEL_NAME}
+def create_app(settings: Optional[Settings] = None, *, embedder: Optional[Embedder] = None,
+               store: Optional[VectorStore] = None) -> FastAPI:
+    """Application factory. Pass `embedder` and `store` to replace the defaults (used by the tests)."""
+    settings = settings or Settings.from_env()
+    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        emb = embedder or SentenceTransformerEmbedder(settings.embedding_model, settings.embed_batch_size)
+        if settings.chunk_words * 1.3 > emb.max_tokens:
+            logger.warning("CHUNK_WORDS=%d may exceed the model input limit of %d tokens; the model would ignore "
+                           "the excess text", settings.chunk_words, emb.max_tokens)
+        vector_store = store or QdrantStore(settings)
+        vector_store.ensure_collection(emb.dimension)
+        app.state.settings, app.state.embedder, app.state.store = settings, emb, vector_store
+        app.state.ingestion = IngestionService(emb, vector_store, settings)
+        app.state.search = SearchService(emb, vector_store)
+        yield
+        vector_store.close()
+
+    app = FastAPI(
+        title="Document Ingestion & Search Engine",
+        description="Ingests PDF, CSV and XLSX files and serves semantic search over them, backed by Qdrant.",
+        version="2.0.0", lifespan=lifespan)
+
+    @app.exception_handler(IngestError)
+    async def ingest_error_handler(request: Request, exc: IngestError):
+        return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+
+    @app.get("/health", tags=["health"])
+    def health(request: Request):
+        """Readiness: confirms the vector store is reachable."""
+        try:
+            request.app.state.store.ping()
+        except Exception:
+            logger.exception("Vector store health check failed")
+            return JSONResponse(status_code=503, content={"status": "unavailable", "vector_db": "unreachable"})
+        return {"status": "healthy", "vector_db": "connected", "model": request.app.state.embedder.name}
+
+    app.include_router(router)
+    return app
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+_app: Optional[FastAPI] = None
+
+
+def __getattr__(name: str):
+    """Build the default app lazily, so importing this module (for example from tests) loads no model.
+    `uvicorn main:app` triggers this."""
+    global _app
+    if name == "app":
+        if _app is None:
+            _app = create_app()
+        return _app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
