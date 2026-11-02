@@ -1,266 +1,169 @@
-# AI-Powered Search & Document Ingestion Engine
+# Document Ingestion & Search Engine
 
-An automated ETL and semantic search engine that parses unstructured enterprise documents (PDF, CSV, XLSX), generates dense vector embeddings, and delivers sub-second hybrid retrieval using **FastAPI**, **Sentence-Transformers**, and **Qdrant Vector DB**.
+A service that ingests PDF, CSV and XLSX files, splits them into chunks, and indexes each chunk in a Qdrant
+vector database. Search finds the chunks whose meaning is closest to a natural-language query, with optional
+filters by file type, source file and category.
 
----
+The whole application is a single file, `main.py`.
 
-## 1. Complete Application (`app.py`)
+**Stack:** FastAPI, sentence-transformers, Qdrant, PyMuPDF, pandas and openpyxl (XLSX).
 
-Save the following code as `app.py`:
+## Features
 
-```python
-"""
-AI-Powered Search & Document Ingestion Engine
-Tech Stack: FastAPI, Sentence-Transformers, Qdrant Vector DB, PyMuPDF, Pandas
-"""
+- Ingestion of PDF (per page), CSV and XLSX (per row, across all sheets).
+- Semantic search with metadata filters and an optional minimum score.
+- Safe re-uploads: identical content is a no-op, and a changed file replaces its earlier version.
+- Upload limits, content checks, and clear error codes for bad files.
+- Optional API-key protection.
+- Batched embedding, so large files do not need to fit in memory as vectors.
+- Health endpoint that checks the vector store.
 
-import io
-import os
-import uuid
-from typing import Any, Dict, List, Optional
-from contextlib import asynccontextmanager
+## Requirements
 
-import fitz  # PyMuPDF
-import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
-from pydantic import BaseModel, Field
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from sentence_transformers import SentenceTransformer
+- Python 3.10 or newer
+- A Qdrant server for real use (without one, an in-memory store is used and data is lost on restart)
 
-# ==========================================
-# Configuration & Global State
-# ==========================================
-COLLECTION_NAME = "enterprise_documents"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-VECTOR_DIMENSION = 384
-QDRANT_HOST = os.getenv("QDRANT_HOST", ":memory:")
+```bash
+pip install fastapi "uvicorn[standard]" python-multipart sentence-transformers \
+            "qdrant-client>=1.10" pymupdf pandas openpyxl
+```
 
-client: Optional[QdrantClient] = None
-model: Optional[SentenceTransformer] = None
+The first start downloads the embedding model (`all-MiniLM-L6-v2` by default).
 
+## Run
 
-# ==========================================
-# Lifespan Events
-# ==========================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global client, model
-    # Initialize Embedding Model
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    
-    # Initialize Qdrant Client (In-memory default or remote service)
-    client = QdrantClient(location=QDRANT_HOST)
-    
-    # Ensure Collection Exists
-    collections = client.get_collections().collections
-    exists = any(c.name == COLLECTION_NAME for c in collections)
-    if not exists:
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(
-                size=VECTOR_DIMENSION, 
-                distance=models.Distance.COSINE
-            ),
-        )
-    yield
-    if client:
-        client.close()
+```bash
+# Optional: start Qdrant locally
+docker run -p 6333:6333 qdrant/qdrant
 
+export QDRANT_URL=http://localhost:6333
+uvicorn main:app            # or: python main.py
+```
 
-app = FastAPI(
-    title="AI Document Ingestion & Search Engine",
-    description="Automated ETL pipeline and hybrid semantic retrieval engine.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+Interactive API docs are at `http://localhost:8000/docs`.
 
+## Usage
 
-# ==========================================
-# Schemas
-# ==========================================
-class SearchRequest(BaseModel):
-    query: str = Field(..., description="Natural language search query")
-    limit: int = Field(5, ge=1, le=50, description="Max results to return")
-    doc_type: Optional[str] = Field(None, description="Filter by extension (e.g., 'pdf', 'csv')")
-    source: Optional[str] = Field(None, description="Filter by exact source filename")
+```bash
+# Ingest a file (optionally tag it with a category)
+curl -X POST localhost:8000/ingest \
+  -F "file=@handbook.pdf" -F "custom_category=hr"
 
+# Search
+curl -X POST localhost:8000/search -H "Content-Type: application/json" \
+  -d '{"query": "how many vacation days do I get?", "limit": 3, "doc_type": "pdf"}'
 
-class SearchHit(BaseModel):
-    id: str
-    score: float
-    text: str
-    metadata: Dict[str, Any]
+# Remove a file from the index
+curl -X DELETE "localhost:8000/documents?source=handbook.pdf"
 
+# Health
+curl localhost:8000/health
+```
 
-class SearchResponse(BaseModel):
-    query: str
-    total_results: int
-    results: List[SearchHit]
+If `API_KEY` is set, add `-H "X-API-Key: <your key>"` to `/ingest`, `/search` and `/documents` requests.
 
+## API
 
-class IngestResponse(BaseModel):
-    filename: str
-    chunks_indexed: int
-    status: str
+### `POST /ingest`
 
+Multipart form: `file` (required, `.pdf`, `.csv` or `.xlsx`) and `custom_category` (optional, default `general`).
 
-# ==========================================
-# ETL & Parsing Utilities
-# ==========================================
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-    """Splits raw text into sliding window chunks."""
-    words = text.split()
-    if not words:
-        return []
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i : i + chunk_size])
-        chunks.append(chunk)
-    return chunks
+| Status | Meaning |
+|---|---|
+| `201` | Indexed. Response: `filename`, `document_id`, `chunks_indexed`, `status: "indexed"` |
+| `200` | Identical content was already indexed: `status: "unchanged"` |
+| `401` | Missing or invalid API key |
+| `413` | File larger than `MAX_UPLOAD_MB`, or more than `MAX_CHUNKS_PER_DOCUMENT` chunks |
+| `415` | Unsupported file type |
+| `422` | Empty, corrupt, password-protected or text-free document, or content that does not match the extension |
 
+### `POST /search`
 
-def parse_pdf(file_bytes: bytes) -> str:
-    """Extracts text from PDF documents using PyMuPDF."""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text_content = [page.get_text() for page in doc]
-    return "\n".join(text_content)
+| Field | Type | Description |
+|---|---|---|
+| `query` | string, 1 to 2000 characters | Natural-language query |
+| `limit` | integer, 1 to 50 (default 5) | Number of results |
+| `doc_type` | string, optional | `pdf`, `csv` or `xlsx` |
+| `source` | string, optional | Original filename |
+| `category` | string, optional | Category given at ingestion |
+| `score_threshold` | number from -1 to 1, optional | Minimum similarity score |
 
+Response: `query`, `total_results`, and `results`, each with `id`, `score`, `text` and `metadata`.
 
-def parse_csv(file_bytes: bytes) -> List[str]:
-    """Converts CSV rows into semantic key-value strings."""
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    return [
-        ", ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
-        for _, row in df.iterrows()
-    ]
+Metadata always includes `source`, `doc_type`, `document_id`, `chunk_index` and `category`, plus `page` for PDFs
+and `row` (and `sheet` for XLSX) for tables.
 
+### `DELETE /documents?source=<filename>`
 
-def parse_xlsx(file_bytes: bytes) -> List[str]:
-    """Converts Excel rows across all sheets into semantic text rows."""
-    excel_file = pd.ExcelFile(io.BytesIO(file_bytes))
-    chunks = []
-    for sheet_name in excel_file.sheet_names:
-        df = pd.read_excel(excel_file, sheet_name=sheet_name)
-        sheet_chunks = [
-            f"[Sheet: {sheet_name}] " + ", ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val)])
-            for _, row in df.iterrows()
-        ]
-        chunks.extend(sheet_chunks)
-    return chunks
+Removes every chunk of one file. Returns `source` and `deleted_chunks`.
 
+### `GET /health`
 
-# ==========================================
-# Endpoints
-# ==========================================
-@app.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
-async def ingest_document(
-    file: UploadFile = File(...),
-    custom_category: Optional[str] = Form(None)
-):
-    """
-    Ingests PDF, CSV, or XLSX files, creates chunks, generates embeddings,
-    and indexes vectors into Qdrant.
-    """
-    filename = file.filename or "unknown"
-    ext = filename.split(".")[-1].lower()
-    content = await file.read()
-    
-    if ext == "pdf":
-        raw_text = parse_pdf(content)
-        chunks = chunk_text(raw_text)
-    elif ext == "csv":
-        chunks = parse_csv(content)
-    elif ext in ["xlsx", "xls"]:
-        chunks = parse_xlsx(content)
-    else:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported format: .{ext}. Supported formats: PDF, CSV, XLSX."
-        )
+Returns `200` with `status`, `vector_db` and `model` when Qdrant is reachable, and `503` otherwise.
+This endpoint does not need an API key.
 
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No extractable text found in file.")
+## How it works
 
-    # Generate Embeddings (Batched)
-    embeddings = model.encode(chunks, batch_size=64, show_progress_bar=False).tolist()
+1. **Parse.** PDFs are read page by page. CSV and XLSX files produce one chunk per row in the form
+   `column: value, column: value` (XLSX rows are prefixed with `[Sheet: name]`). Values are kept exactly as
+   written, so identifiers such as `007` stay intact. CSV delimiters (`,` `;` tab `|`) are detected from the
+   header row, and non-UTF-8 files are read as Latin-1.
+2. **Chunk.** Text is split into overlapping windows of words (`CHUNK_WORDS`, `CHUNK_OVERLAP`). Table rows
+   longer than one window are split the same way.
+3. **Embed.** Chunks are embedded in batches with the sentence-embedding model and normalised.
+4. **Store.** Vectors and metadata are upserted into Qdrant (cosine distance). Payload indexes are created on
+   `source`, `doc_type`, `category` and `document_id` so filtered search stays fast.
+5. **Search.** The query is embedded the same way and the closest chunks are returned.
 
-    # Index Points into Qdrant
-    points = []
-    for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
-        points.append(
-            models.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
-                payload={
-                    "source": filename,
-                    "doc_type": ext,
-                    "chunk_index": i,
-                    "text": chunk,
-                    "category": custom_category or "general"
-                }
-            )
-        )
+**Chunk size matters.** `all-MiniLM-L6-v2` reads at most 256 word pieces per input and ignores the rest.
+The default of 160 words fits. If you raise `CHUNK_WORDS`, the service warns at startup when the value is too large
+for the model. If you change `EMBEDDING_MODEL` to one with a different vector size, use a new `COLLECTION_NAME`;
+the service refuses to start against a collection with a mismatched size.
 
-    client.upsert(collection_name=COLLECTION_NAME, points=points, wait=True)
+**Idempotent uploads.** Each file gets a `document_id` (SHA-256 of its bytes) and each chunk a deterministic
+point id. Uploading the same content again changes nothing; uploading a changed file with the same name replaces
+the old chunks only after the new ones are stored. A failed upload removes its partial chunks.
 
-    return IngestResponse(
-        filename=filename,
-        chunks_indexed=len(points),
-        status="Indexed successfully"
-    )
+## Configuration
 
+Environment variables:
 
-@app.post("/search", response_model=SearchResponse)
-async def search_documents(request: SearchRequest):
-    """
-    Hybrid search combining vector similarity with payload metadata filtering.
-    """
-    query_vector = model.encode(request.query).tolist()
+| Variable | Default | Description |
+|---|---|---|
+| `QDRANT_URL` | unset | Qdrant server URL. Unset: in-memory store, data lost on restart |
+| `QDRANT_API_KEY` | unset | Qdrant API key, if the server requires one |
+| `COLLECTION_NAME` | `enterprise_documents` | Qdrant collection |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model name |
+| `API_KEY` | unset | When set, `/ingest`, `/search` and `/documents` require the `X-API-Key` header |
+| `MAX_UPLOAD_MB` | `50` | Largest accepted file |
+| `MAX_CHUNKS_PER_DOCUMENT` | `50000` | Largest number of chunks per file |
+| `CHUNK_WORDS` | `160` | Words per chunk |
+| `CHUNK_OVERLAP` | `30` | Words shared between neighbouring chunks |
+| `EMBED_BATCH_SIZE` | `64` | Chunks embedded and uploaded per batch |
+| `LOG_LEVEL` | `INFO` | Logging level |
 
-    filter_conditions = []
-    if request.doc_type:
-        filter_conditions.append(
-            models.FieldCondition(
-                key="doc_type",
-                match=models.MatchValue(value=request.doc_type.lower())
-            )
-        )
-    if request.source:
-        filter_conditions.append(
-            models.FieldCondition(
-                key="source",
-                match=models.MatchValue(value=request.source)
-            )
-        )
+## Limitations
 
-    query_filter = models.Filter(must=filter_conditions) if filter_conditions else None
+- Scanned PDFs without a text layer return `422`; there is no OCR.
+- Legacy `.xls` files are not supported. Convert them to `.xlsx`.
+- Search is semantic only; there is no keyword or hybrid ranking.
+- Files are processed in the API process. For heavy or high-volume ingestion, move parsing and embedding to a
+  background worker queue.
+- Filenames identify documents. Two different files with the same name replace each other; use distinct names
+  (or add a prefix per tenant or project) if that is a concern.
+- Not included: per-user access control, rate limiting, and OCR.
 
-    hits = client.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
-        query_filter=query_filter,
-        limit=request.limit
-    )
+## Tests
 
-    results = [
-        SearchHit(
-            id=str(hit.id),
-            score=hit.score,
-            text=hit.payload.get("text", ""),
-            metadata={k: v for k, v in hit.payload.items() if k != "text"}
-        )
-        for hit in hits
-    ]
+```bash
+pip install httpx
+python -m unittest test_main -v
+```
 
-    return SearchResponse(query=request.query, total_results=len(results), results=results)
+The tests use in-memory stand-ins for the embedding model and Qdrant, so no model download or server is needed.
+They cover chunking, filename and content checks, CSV and XLSX parsing, batching, idempotent re-uploads,
+replacement of old versions, cleanup after failures, size limits, search filters, deletion, settings, API-key
+protection and error codes.
 
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "vector_db": "connected", "model": EMBEDDING_MODEL_NAME}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+They do not cover PDF parsing or the real Qdrant and sentence-transformers adapters; try those against a real
+Qdrant instance with a sample PDF before relying on them in production.
